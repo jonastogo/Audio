@@ -4,6 +4,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioFormat.Encoding;
@@ -20,13 +21,28 @@ import javax.sound.sampled.UnsupportedAudioFileException;
 //   Ausgabe: Ergebnis der Transformation
 //sign=-1: Hintransformation; sign=1: Ruecktransformation
 
-public class FFTbase {
+public class FFTbase implements Runnable {
 	static double[]		realData;
-	static double[]		imagData;
-	static int			length	= 0;
-	static Complex[]	freq;
+	double[]			imagData;
+	int					length	= 0;
+	int					laenge;
+	Complex[]			freq;
+	Complex[]			oneMS;
+	Complex[]			data;
+	ArrayList<Double>	list;
+	ArrayList<Double>	list2;
+	int					bit;
+	static int			n;
+	float				samplesPerSec;
 
-	public static Complex[] fft(Complex[] x) {
+	static long			bytesPer10MS;
+
+	FFTbase(int i, double[] realData) {
+		this.laenge = i;
+		this.realData = realData;
+	}
+
+	public Complex[] fft(Complex[] x) {
 		int N = x.length;
 
 		// base case
@@ -36,9 +52,9 @@ public class FFTbase {
 			};
 
 		// radix 2 Cooley-Tukey FFT
-		if (N % 2 != 0) {
-			throw new RuntimeException("N is not a power of 2");
-		}
+		int levels = 31 - Integer.numberOfLeadingZeros(N); // Equal to floor(log2(n))
+		if (1 << levels != N)
+			throw new IllegalArgumentException("Length is not a power of 2");
 
 		// fft of even terms
 		Complex[] even = new Complex[N / 2];
@@ -66,248 +82,107 @@ public class FFTbase {
 		return y;
 	}
 
-	/*
-	 * Computes the discrete Fourier transform (DFT) of the given complex vector, storing the result back into the vector.
-	 * The vector can have any length. This is a wrapper function.
-	 */
-	public static void transform(double[] real, double[] imag) {
-		if (real.length != imag.length)
-			throw new IllegalArgumentException("Mismatched lengths");
-
-		int n = real.length;
-		if (n == 0)
-			return;
-		else if ((n & (n - 1)) == 0) // Is power of 2
-			transformRadix2(real, imag);
-		else
-			// More complicated algorithm for arbitrary sizes
-			transformBluestein(real, imag);
-	}
-
-	/*
-	 * Computes the inverse discrete Fourier transform (IDFT) of the given complex vector, storing the result back into the vector.
-	 * The vector can have any length. This is a wrapper function. This transform does not perform scaling, so the inverse is not a true inverse.
-	 */
-	public static void inverseTransform(double[] real, double[] imag) {
-		transform(imag, real);
-	}
-
-	/*
-	 * Computes the discrete Fourier transform (DFT) of the given complex vector, storing the result back into the vector.
-	 * The vector's length must be a power of 2. Uses the Cooley-Tukey decimation-in-time radix-2 algorithm.
-	 */
-	public static void transformRadix2(double[] real, double[] imag) {
-		// Initialization
-		if (real.length != imag.length)
-			throw new IllegalArgumentException("Mismatched lengths");
-		int n = real.length;
-		int levels = 31 - Integer.numberOfLeadingZeros(n); // Equal to floor(log2(n))
-		if (1 << levels != n)
-			throw new IllegalArgumentException("Length is not a power of 2");
-		double[] cosTable = new double[n / 2];
-		double[] sinTable = new double[n / 2];
-		for (int i = 0; i < n / 2; i++) {
-			cosTable[i] = Math.cos(2 * Math.PI * i / n);
-			sinTable[i] = Math.sin(2 * Math.PI * i / n);
-		}
-
-		// Bit-reversed addressing permutation
-		for (int i = 0; i < n; i++) {
-			int j = Integer.reverse(i) >>> (32 - levels);
-			if (j > i) {
-				double temp = real[i];
-				real[i] = real[j];
-				real[j] = temp;
-				temp = imag[i];
-				imag[i] = imag[j];
-				imag[j] = temp;
-			}
-		}
-
-		// Cooley-Tukey decimation-in-time radix-2 FFT
-		for (int size = 2; size <= n; size *= 2) {
-			int halfsize = size / 2;
-			int tablestep = n / size;
-			for (int i = 0; i < n; i += size) {
-				for (int j = i, k = 0; j < i + halfsize; j++, k += tablestep) {
-					double tpre = real[j + halfsize] * cosTable[k] + imag[j + halfsize] * sinTable[k];
-					double tpim = -real[j + halfsize] * sinTable[k] + imag[j + halfsize] * cosTable[k];
-					real[j + halfsize] = real[j] - tpre;
-					imag[j + halfsize] = imag[j] - tpim;
-					real[j] += tpre;
-					imag[j] += tpim;
-				}
-			}
-			if (size == n) // Prevent overflow in 'size *= 2'
-				break;
-		}
-		realData = real;
-		imagData = imag;
-	}
-
-	/*
-	 * Computes the discrete Fourier transform (DFT) of the given complex vector, storing the result back into the vector.
-	 * The vector can have any length. This requires the convolution function, which in turn requires the radix-2 FFT function.
-	 * Uses Bluestein's chirp z-transform algorithm.
-	 */
-	public static void transformBluestein(double[] real, double[] imag) {
-		// Find a power-of-2 convolution length m such that m >= n * 2 + 1
-		if (real.length != imag.length)
-			throw new IllegalArgumentException("Mismatched lengths");
-		int n = real.length;
-		if (n >= 0x20000000)
-			throw new IllegalArgumentException("Array too large");
-		int m = Integer.highestOneBit(n * 2 + 1) << 1;
-
-		// Trignometric tables
-		double[] cosTable = new double[n];
-		double[] sinTable = new double[n];
-		for (int i = 0; i < n; i++) {
-			int j = (int) ((long) i * i % (n * 2)); // This is more accurate than j = i * i
-			cosTable[i] = Math.cos(Math.PI * j / n);
-			sinTable[i] = Math.sin(Math.PI * j / n);
-		}
-
-		// Temporary vectors and preprocessing
-		double[] areal = new double[m];
-		double[] aimag = new double[m];
-		for (int i = 0; i < n; i++) {
-			areal[i] = real[i] * cosTable[i] + imag[i] * sinTable[i];
-			aimag[i] = -real[i] * sinTable[i] + imag[i] * cosTable[i];
-		}
-		double[] breal = new double[m];
-		double[] bimag = new double[m];
-		breal[0] = cosTable[0];
-		bimag[0] = sinTable[0];
-		for (int i = 1; i < n; i++) {
-			breal[i] = breal[m - i] = cosTable[i];
-			bimag[i] = bimag[m - i] = sinTable[i];
-		}
-
-		// Convolution
-		double[] creal = new double[m];
-		double[] cimag = new double[m];
-		convolve(areal, aimag, breal, bimag, creal, cimag);
-
-		// Postprocessing
-		for (int i = 0; i < n; i++) {
-			real[i] = creal[i] * cosTable[i] + cimag[i] * sinTable[i];
-			imag[i] = -creal[i] * sinTable[i] + cimag[i] * cosTable[i];
-		}
-	}
-
-	/*
-	 * Computes the circular convolution of the given real vectors. Each vector's length must be the same.
-	 */
-	public static void convolve(double[] x, double[] y, double[] out) {
-		if (x.length != y.length || x.length != out.length)
-			throw new IllegalArgumentException("Mismatched lengths");
-		int n = x.length;
-		convolve(x, new double[n], y, new double[n], out, new double[n]);
-	}
-
-	/*
-	 * Computes the circular convolution of the given complex vectors. Each vector's length must be the same.
-	 */
-	public static void convolve(double[] xreal, double[] ximag, double[] yreal, double[] yimag, double[] outreal, double[] outimag) {
-		if (xreal.length != ximag.length || xreal.length != yreal.length || yreal.length != yimag.length || xreal.length != outreal.length || outreal.length != outimag.length)
-			throw new IllegalArgumentException("Mismatched lengths");
-
-		int n = xreal.length;
-		xreal = xreal.clone();
-		ximag = ximag.clone();
-		yreal = yreal.clone();
-		yimag = yimag.clone();
-
-		transform(xreal, ximag);
-		transform(yreal, yimag);
-		for (int i = 0; i < n; i++) {
-			double temp = xreal[i] * yreal[i] - ximag[i] * yimag[i];
-			ximag[i] = ximag[i] * yreal[i] + xreal[i] * yimag[i];
-			xreal[i] = temp;
-		}
-		inverseTransform(xreal, ximag);
-		for (int i = 0; i < n; i++) { // Scaling (because this FFT implementation omits it)
-			outreal[i] = xreal[i] / n;
-			outimag[i] = ximag[i] / n;
-		}
-	}
-
 	public static void main(String[] args) throws UnsupportedAudioFileException, IOException {
+		FFTbase fftb = new FFTbase(0, null);
 		int r = 0;
 		int n = 0;
 		int l;
-		double[] realData = readFully(new File("Windows Logon.wav"));
+		realData = fftb.readFully(new File("10000.wav"));
+		System.out.println("realdata: " + realData.length);
 		double[] imagData = new double[realData.length];
 		double[] range = new double[12];
+		fftb.freq = new Complex[realData.length];
 
 		// double[time in millisecs][frequenzen] 882bytes
-		Complex[] data = new Complex[realData.length];
-		freq = new Complex[realData.length];
-		for (int i = 0; i < imagData.length; i++)
-			imagData[i] = 0;
-		for (int i = 0; i < realData.length; i++) {
-			data[i] = new Complex(realData[i], imagData[i]);
-		}
+		fftb.data = new Complex[(int) bytesPer10MS];
+		// for (int i = 0; i < imagData.length; i++)
+		// imagData[i] = 0;
+		// for (int i = 0; i < realData.length; i++) {
+		// data[i] = new Complex(realData[i], imagData[i]);
+		// }
 
-		fft(data);
+		// fft(data);
+		Thread t1 = new Thread(new FFTbase(realData.length, realData));
+		t1.start();
 
-		l = retLength();
-		System.out.println("laenge: " + l);
+		l = fftb.retLength();
 		double[] nfreq = new double[l / 12];
 		while (r < l) {
 			if (r + 12 < l) {
 				for (int i = 0; i < 12; i++) {
-					range[i] = freq[r].re;
+					range[i] = fftb.freq[r].re;
 					r++;
 				}
 			} else {
-				System.out.println("hallo?");
 				break;
 			}
-			nfreq[n] = retMaxOfRange(range);
+			nfreq[n] = fftb.retMaxOfRange(range);
 			n++;
 		}
 
 		System.out.println("hier kommt die ausgabe");
-		for (int j = 0; j < nfreq.length / 2; j++) {
-			System.out.println(nfreq[j]);
-		}
+		// for (int j = 0; j < nfreq.length / 2; j++) {
+		// System.out.println(j + ": " + nfreq[j]);
+		// }
 	}
 
-	public static double[] readFully(File file) throws UnsupportedAudioFileException, IOException {
+	/**
+	 * Berechnet ein Array welches 2^n groß ist und die Samples enthällt
+	 * 
+	 * @param file
+	 * @return double[] samples
+	 * @throws UnsupportedAudioFileException
+	 * @throws IOException
+	 */
+	public double[] readFully(File file) throws UnsupportedAudioFileException, IOException {
 		byte[] bytes = null;
-		double[] ret = null;
-		double[] samp = null;
+		Double[] ret = null;
+		Double[] samp = null;
 		double[] samples = null;
+
+		/*
+		 * Einlesen der Ton-Datei
+		 * Ausgeben von wichtigen Daten
+		 */
+		long time = -System.nanoTime();
+
 		AudioInputStream audioInputStream = AudioSystem.getAudioInputStream(file);
 		AudioFormat fmt = audioInputStream.getFormat();
+
+		bit = fmt.getSampleSizeInBits();
+		samplesPerSec = fmt.getSampleRate();
+		bytesPer10MS = (long) (bit * samplesPerSec / 800);
+
+		System.out.println(time + System.nanoTime() + "ns1");
+		/*
+		 * Audio wird zu Byte Array konvertiert
+		 */
+		long time2 = -System.nanoTime();
 		try {
 			if (fmt.getEncoding() != Encoding.PCM_SIGNED) {
 				throw new UnsupportedAudioFileException();
 			}
-
 			// read the data fully
 			bytes = new byte[audioInputStream.available()];
-			System.out.println(audioInputStream.available());
 			audioInputStream.read(bytes);
 		} finally {
 			audioInputStream.close();
 		}
-
-		int bits = fmt.getSampleSizeInBits();
-		System.out.println("bits: " + bits);
-		double max = Math.pow(2, bits - 1);
+		double max = Math.pow(2, bit - 1);
 
 		ByteBuffer bb = ByteBuffer.wrap(bytes);
 		bb.order(fmt.isBigEndian() ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN);
 
-		samp = new double[bytes.length * 8 / bits];
-		// convert sample-by-sample to a scale of
-		// -1.0 <= samples[i] < 1.0
-		// System.out.println(samp.length);
+		samp = new Double[bytes.length * 8 / bit];
+		System.out.println(time2 + System.nanoTime() + "ns2");
+		/*
+		 * convert sample-by-sample to a scale of
+		 * -1.0 <= samples[i] < 1.0
+		 * System.out.println(samp.length);
+		 */
+		long time3 = -System.nanoTime();
 		for (int i = 0; i < samp.length; ++i) {
-			switch (bits) {
+			switch (bit) {
 				case 8:
 					samp[i] = (bb.get() / max);
 					// System.out.println(bb.get() / max);
@@ -328,33 +203,50 @@ public class FFTbase {
 					throw new UnsupportedAudioFileException();
 			}
 		}
+		// for (double d : samp)
+		// System.out.println(d);
+		System.out.println(time3 + System.nanoTime() + "ns3");
 
-		ret = new double[(samp.length / 2)];
-		length = ret.length;
-		System.out.println("retlänge: " + ret.length + "  samplänge: " + samp.length + "  byteslänge: " + bytes.length);
-		for (int i = 1, j = 0; i < samp.length; i += 2, j++)
-			ret[j] = samp[i];
+		list = new ArrayList<Double>();
 
-		int n = 1;
-		while (true) {
-			long length = (long) Math.pow(2, n);
-			if (length >= ret.length)
-				break;
-			n += 1;
+		long time4 = -System.nanoTime();
+		// list = new ArrayList<Double>(Arrays.asList(samp));
+		for (int i = 1; i < samp.length; i += 2) {
+			list.add((Double) samp[i]);
 		}
-		long samplesLength = (long) Math.pow(2, n);
-		samples = new double[(int) samplesLength];
-		System.out.println(samples.length);
-		for (int i = 0; i < samplesLength; i++) {
-			if ((ret.length) > i)
-				samples[i] = ret[i];
+		System.out.println(time4 + System.nanoTime() + "ns4");
+		System.out.println();
+		// for (Double d : list)
+		// System.out.println("List: " + d);
+
+		/*
+		 * berechnet die benötigte Größte des Input Array (muss 2^n sein, n€N)
+		 */
+		/*
+		 * Erstellt ein neues Array mit der Größe 2^n und setzt die leeren Felder 0
+		 */
+		long time7 = -System.nanoTime();
+		n = getPowerof2(list.size());
+		samples = new double[n];
+		for (int i = 0; i < n; i++) {
+			if ((list.size()) > i)
+				samples[i] = list.get(i);
 			else
 				samples[i] = 0;
 		}
+		System.out.println(time7 + System.nanoTime() + "ns7");
+		// for (double d : samples)
+		// System.out.println("Samples: " + d);
 		return samples;
 	}
 
-	public static String toString(int i) {
+	/**
+	 * Ausgabe von RealData und ImagData
+	 * 
+	 * @param i
+	 * @return String Complex
+	 */
+	public String toString(int i) {
 		if (imagData[i] == 0)
 			return Double.toString(realData[i]);
 		if (realData[i] == 0)
@@ -364,17 +256,34 @@ public class FFTbase {
 		return realData[i] + " + " + imagData[i] + "i";
 	}
 
-	public static String toStringReal(int i) {
+	/**
+	 * Ausgabe von RealData
+	 * 
+	 * @param i
+	 * @return realData
+	 */
+	public String toStringReal(int i) {
 		return Double.toString(realData[i]);
 
 	}
 
-	public static String toStringImag(int i) {
+	/**
+	 * Ausgabe von ImagData
+	 * 
+	 * @param i
+	 * @return imagData
+	 */
+	public String toStringImag(int i) {
 		return Double.toString(imagData[i]);
 
 	}
 
-	public static int retLength() {
+	/**
+	 * Ausgabe der Länge von freq
+	 * 
+	 * @return freq length
+	 */
+	public int retLength() {
 		for (int j = 0; j < freq.length / 2; j++) {
 			if (freq[j] == null)
 				return j;
@@ -382,12 +291,65 @@ public class FFTbase {
 		return freq.length;
 	}
 
-	public static double retMaxOfRange(double[] range) {
+	/**
+	 * Ausgabe des Maximalwertes von einem Array
+	 * 
+	 * @param range
+	 * @return max
+	 */
+	public double retMaxOfRange(double[] range) {
 		double max = 0;
 		for (int i = 0; i < range.length; i++) {
 			if (Math.abs(range[i]) > max)
 				max = Math.abs(range[i]);
 		}
 		return max;
+	}
+
+	@Override
+	public void run() {
+		int r = 0;
+		int l = laenge;
+		int durchgang = 0;
+		int bytes = getPowerof2((int) bytesPer10MS);
+		data = new Complex[bytes];
+		System.out.println(data.length);
+		while (r < l) {
+			long time4 = -System.nanoTime();
+			if (r + (int) bytesPer10MS < l) {
+				for (int i = 0; i < bytesPer10MS; i++, r++) {
+					data[i] = new Complex(realData[r], 0);
+				}
+			} else
+				break;
+			for (int i = (int) bytesPer10MS; i < bytes; i++) {
+				data[i] = new Complex(0, 0);
+			}
+			freq = fft(data);
+			for (Complex c : freq)
+				if (durchgang == 10)
+					System.out.println(c.re);
+			// System.out.println(time4 + System.nanoTime() + "ns run");
+			try {
+				durchgang++;
+				// System.out.println("FERTIG!");
+				Thread.sleep(5);
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
+		}
+	}
+
+	/**
+	 * Berechnung der nächst größeren 2er-Potenz von i
+	 * 
+	 * @param i
+	 * @return nächst größeren 2er-Potenz von i
+	 */
+	public static int getPowerof2(int i) {
+		int levels = 31 - Integer.numberOfLeadingZeros(i); // Equal to floor(log2(n))
+		if (1 << levels != i)
+			return Integer.highestOneBit(i * 2 - 1);
+		return 1;
 	}
 }
